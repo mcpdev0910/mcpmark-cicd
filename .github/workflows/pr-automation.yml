@@ -1,0 +1,420 @@
+name: Pull Request Automation Workflow
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  code-quality:
+    name: code-quality
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies (ci preferred)
+        id: install_deps_code
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run ESLint
+        id: run_eslint
+        run: |
+          set +e
+          echo "Running npm run lint..."
+          npm run lint | tee eslint-output.txt
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
+          if [ -f eslint-output.txt ]; then
+            tail -n 200 eslint-output.txt >> "$GITHUB_OUTPUT"
+          else
+            echo "No ESLint output found." >> "$GITHUB_OUTPUT"
+          fi
+          echo "EOF" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Run Prettier formatting check
+        id: run_prettier
+        run: |
+          set +e
+          echo "Running Prettier check..."
+          npx --yes prettier@3.3.3 --check . | tee prettier-output.txt
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
+          if [ -f prettier-output.txt ]; then
+            tail -n 200 prettier-output.txt >> "$GITHUB_OUTPUT"
+          else
+            echo "No Prettier output found." >> "$GITHUB_OUTPUT"
+          fi
+          echo "EOF" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Upload code quality artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: code-quality-outputs
+          path: |
+            eslint-output.txt
+            prettier-output.txt
+          if-no-files-found: warn
+
+      - name: Post Code Quality Report
+        id: comment_code_quality
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const issue_number = (context.issue.number) || (context.payload.pull_request && context.payload.pull_request.number);
+            const eslintExit = `${{ steps.run_eslint.outputs.exit_code }}`;
+            const eslintSummary = `${{ steps.run_eslint.outputs.summary }}`;
+            const prettierExit = `${{ steps.run_prettier.outputs.exit_code }}`;
+            const prettierSummary = `${{ steps.run_prettier.outputs.summary }}`;
+            const body = [
+              'Code Quality Report',
+              '',
+              'ESLint',
+              `Status: ${eslintExit === '0' ? 'Passed' : 'Completed with warnings/errors'}`,
+              '```',
+              eslintSummary || 'No ESLint output.',
+              '```',
+              '',
+              'Prettier',
+              `Status: ${prettierExit === '0' ? 'Passed' : 'Formatting differences detected'}`,
+              '```',
+              prettierSummary || 'No Prettier output.',
+              '```'
+            ].join('\n');
+            await github.rest.issues.createComment({owner, repo, issue_number, body});
+
+  testing-suite:
+    name: testing-suite
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies (ci preferred)
+        id: install_deps_tests
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Detect test framework
+        id: detect_test_tools
+        run: |
+          node -e "const fs=require('fs'); const pkg=require('./package.json'); const has=(p)=>p&&('jest' in p); const hasNy=(p)=>p&&('nyc' in p); const framework=(has(pkg.dependencies)||has(pkg.devDependencies))?'jest':(hasNy(pkg.dependencies)||hasNy(pkg.devDependencies))?'nyc':'none'; fs.appendFileSync(process.env.GITHUB_OUTPUT, `framework=${framework}\n`);"
+
+      - name: Run tests with coverage (jest)
+        if: steps.detect_test_tools.outputs.framework == 'jest'
+        id: run_tests_jest
+        run: |
+          set +e
+          echo "Running tests with Jest coverage..."
+          npm test -- --coverage | tee test-output.txt
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          exit 0
+        continue-on-error: true
+
+      - name: Run tests with coverage (nyc)
+        if: steps.detect_test_tools.outputs.framework == 'nyc'
+        id: run_tests_nyc
+        run: |
+          set +e
+          echo "Running tests with NYC coverage..."
+          npx --no-install nyc npm test | tee test-output.txt
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          exit 0
+        continue-on-error: true
+
+      - name: Run tests (fallback)
+        if: steps.detect_test_tools.outputs.framework == 'none'
+        id: run_tests_fallback
+        run: |
+          set +e
+          echo "Running tests without coverage (fallback)..."
+          npm test | tee test-output.txt
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          exit 0
+        continue-on-error: true
+
+      - name: Collect coverage summary
+        id: collect_coverage_summary
+        run: |
+          SUMMARY="Test Coverage Report\n\nNo coverage report detected."
+          if [ -f coverage/coverage-summary.json ]; then
+            ST=$(jq -r '.total.statements.pct' coverage/coverage-summary.json)
+            BR=$(jq -r '.total.branches.pct' coverage/coverage-summary.json)
+            FN=$(jq -r '.total.functions.pct' coverage/coverage-summary.json)
+            LN=$(jq -r '.total.lines.pct' coverage/coverage-summary.json)
+            SUMMARY=$(cat <<EOF
+Test Coverage Report
+
+Statements: ${ST}%
+Branches: ${BR}%
+Functions: ${FN}%
+Lines: ${LN}%
+EOF
+)
+          fi
+          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$SUMMARY" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Upload coverage artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-artifacts
+          path: |
+            coverage/**
+            test-output.txt
+          if-no-files-found: warn
+
+      - name: Post Test Coverage Report
+        id: comment_coverage
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const issue_number = (context.issue.number) || (context.payload.pull_request && context.payload.pull_request.number);
+            const coverageSummary = `${{ steps.collect_coverage_summary.outputs.summary }}`;
+            const body = coverageSummary;
+            await github.rest.issues.createComment({owner, repo, issue_number, body});
+
+  security-scan:
+    name: security-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies (ci preferred)
+        id: install_deps_security
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Run npm audit
+        id: npm_audit
+        run: |
+          set +e
+          echo "Running npm audit..."
+          npm audit --json > npm-audit.json || true
+          echo "Parsing npm audit results..."
+          CRIT=$(jq -r '.metadata.vulnerabilities.critical // 0' npm-audit.json 2>/dev/null || echo 0)
+          HIGH=$(jq -r '.metadata.vulnerabilities.high // 0' npm-audit.json 2>/dev/null || echo 0)
+          MOD=$(jq -r '.metadata.vulnerabilities.moderate // 0' npm-audit.json 2>/dev/null || echo 0)
+          LOW=$(jq -r '.metadata.vulnerabilities.low // 0' npm-audit.json 2>/dev/null || echo 0)
+          echo "critical=$CRIT" >> "$GITHUB_OUTPUT"
+          echo "high=$HIGH" >> "$GITHUB_OUTPUT"
+          echo "moderate=$MOD" >> "$GITHUB_OUTPUT"
+          echo "low=$LOW" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Scan for secrets with Gitleaks
+        id: gitleaks_scan
+        uses: gitleaks/gitleaks-action@v2
+        with:
+          args: --no-git -v --report-format json --report-path gitleaks-report.json
+        env:
+          GITLEAKS_EXIT_ZERO: 'true'
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Summarize security scan results
+        id: summarize_security
+        run: |
+          GL_FINDINGS=0
+          if [ -f gitleaks-report.json ]; then
+            GL_FINDINGS=$(jq 'length' gitleaks-report.json 2>/dev/null || echo 0)
+          fi
+          echo "gitleaks_findings=$GL_FINDINGS" >> "$GITHUB_OUTPUT"
+
+      - name: Upload security artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports
+          path: |
+            npm-audit.json
+            gitleaks-report.json
+          if-no-files-found: warn
+
+      - name: Post Security Scan Report
+        id: comment_security
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const issue_number = (context.issue.number) || (context.payload.pull_request && context.payload.pull_request.number);
+            const critical = `${{ steps.npm_audit.outputs.critical }}`;
+            const high = `${{ steps.npm_audit.outputs.high }}`;
+            const moderate = `${{ steps.npm_audit.outputs.moderate }}`;
+            const low = `${{ steps.npm_audit.outputs.low }}`;
+            const gitleaksFindings = `${{ steps.summarize_security.outputs.gitleaks_findings }}`;
+            const body = [
+              'Security Scan Report',
+              '',
+              'Dependencies',
+              `Vulnerabilities: Critical=${critical}, High=${high}, Moderate=${moderate}, Low=${low}`,
+              '',
+              'Secrets Scan (Gitleaks)',
+              `Findings: ${gitleaksFindings}`,
+            ].join('\n');
+            await github.rest.issues.createComment({owner, repo, issue_number, body});
+
+  build-validation:
+    name: build-validation
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies (ci preferred)
+        id: install_deps_build
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build application
+        id: build_app
+        run: |
+          set +e
+          echo "Attempting to build application..."
+          npm run build --if-present | tee build-output.txt
+          EXIT_CODE=$?
+          echo "exit_code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+          echo "summary<<EOF" >> "$GITHUB_OUTPUT"
+          tail -n 200 build-output.txt >> "$GITHUB_OUTPUT" || true
+          echo "EOF" >> "$GITHUB_OUTPUT"
+        continue-on-error: true
+
+      - name: Create deployment preview artifact
+        id: create_preview
+        run: |
+          set -e
+          OUTFILE=deployment-preview.zip
+          rm -f "$OUTFILE"
+          # Try common build output directories
+          if [ -d dist ]; then
+            zip -r "$OUTFILE" dist >/dev/null
+          elif [ -d build ]; then
+            zip -r "$OUTFILE" build >/dev/null
+          elif [ -d .next ]; then
+            zip -r "$OUTFILE" .next >/dev/null
+          else
+            echo "No standard build output directory found. Creating placeholder artifact." > PREVIEW_INFO.txt
+            zip -r "$OUTFILE" PREVIEW_INFO.txt >/dev/null
+          fi
+        shell: bash
+
+      - name: Validate endpoints are accessible
+        id: validate_endpoints
+        run: |
+          set +e
+          PORT=${PORT:-3000}
+          echo "Attempting to start app and validate endpoints on port $PORT..."
+          (npm run start --if-present &) 2>/dev/null
+          APP_PID=$!
+          ATTEMPTS=15
+          SLEEP=2
+          STARTED=0
+          for i in $(seq 1 $ATTEMPTS); do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${PORT}/")
+            if [ "$STATUS" != "000" ]; then
+              STARTED=1
+              break
+            fi
+            sleep $SLEEP
+          done
+          ROOT_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${PORT}/")
+          HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:${PORT}/health")
+          echo "root_status=$ROOT_STATUS" >> "$GITHUB_OUTPUT"
+          echo "health_status=$HEALTH_STATUS" >> "$GITHUB_OUTPUT"
+          if [ "$APP_PID" != "" ]; then
+            kill $APP_PID 2>/dev/null || true
+          fi
+        continue-on-error: true
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-preview
+          path: |
+            deployment-preview.zip
+            build-output.txt
+          if-no-files-found: warn
+
+      - name: Post Build Validation status
+        id: comment_build
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const issue_number = (context.issue.number) || (context.payload.pull_request && context.payload.pull_request.number);
+            const buildExit = `${{ steps.build_app.outputs.exit_code }}`;
+            const buildSummary = `${{ steps.build_app.outputs.summary }}`;
+            const rootStatus = `${{ steps.validate_endpoints.outputs.root_status }}`;
+            const healthStatus = `${{ steps.validate_endpoints.outputs.health_status }}`;
+            const body = [
+              'Build Validation',
+              '',
+              `Build Status: ${buildExit === '0' ? 'Success' : 'Completed with warnings/errors'}`,
+              '```',
+              buildSummary || 'No build logs available.',
+              '```',
+              '',
+              'Endpoint checks:',
+              `GET / -> HTTP ${rootStatus || 'N/A'}`,
+              `GET /health -> HTTP ${healthStatus || 'N/A'}`
+            ].join('\n');
+            await github.rest.issues.createComment({owner, repo, issue_number, body});
